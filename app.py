@@ -739,6 +739,7 @@ def index():
 @app.get("/api/health")
 def health():
     return {"ok": True, "model": MODEL, "llm_last": LLM_LAST,
+            "ci": "github-actions",
             "key": "已配置" if API_KEY else "未配置", "db": os.path.basename(db.SQLITE_PATH)}
 
 
