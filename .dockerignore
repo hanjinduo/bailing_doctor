@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.idea/
+.git/
+frontend/node_modules/
+node_modules/
+logs/
+uploads/
+tests/
+*.db
+*.db.*
+*bak*
+*.log
+run8021.py
+app_2026*.py
+index.legacy.html

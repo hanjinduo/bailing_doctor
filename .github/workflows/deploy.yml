@@ -1,0 +1,49 @@
+name: Deploy bailing_doctor
+
+# 课程五补充·第七章 CI/CD 主线：push 到 main → 自托管 runner 自动拉取并部署
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    # 与 centos7 虚拟机上的 runner 标签一致（见 /root/actions-runner-bailing/.runner）
+    runs-on: [self-hosted, centos7-local]
+    steps:
+      - name: 1. 拉取最新代码
+        run: |
+          set -e
+          cd /root/app
+          git fetch --all --prune
+          git reset --hard origin/main
+          echo "当前提交: $(git log -1 --pretty='%h %s')"
+
+      - name: 2. 安装/更新 Python 依赖
+        run: |
+          set -e
+          cd /root/app
+          /opt/miniconda3/envs/bailing/bin/pip install -q -r requirements.txt
+          echo "依赖已同步"
+
+      - name: 3. 重启 systemd 服务
+        run: |
+          set -e
+          systemctl restart bailing
+          sleep 5
+          systemctl is-active bailing
+          echo "服务已重启"
+
+      - name: 4. 健康检查
+        run: |
+          set -e
+          root_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 http://127.0.0.1:8010/)
+          api_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 http://127.0.0.1:8010/api/health)
+          echo "首页 HTTP $root_code"
+          echo "接口 HTTP $api_code"
+          if [ "$root_code" != "200" ] || [ "$api_code" != "200" ]; then
+            echo "健康检查失败，最近日志："
+            tail -50 /root/app/logs/*.log 2>/dev/null || journalctl -u bailing -n 50 --no-pager
+            exit 1
+          fi
+          echo "健康检查通过"

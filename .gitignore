@@ -1,0 +1,12 @@
+﻿.env
+static/.env
+bailing.db
+bailing.db.*
+*.bak*
+logs/
+*.log
+uploads/
+__pycache__/
+*.pyc
+.idea/
+node_modules/

@@ -1,0 +1,36 @@
+# 一键起「应用 + PostgreSQL」，演示/试用环境直接用这个
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: bailing
+      POSTGRES_USER: bailing
+      POSTGRES_PASSWORD: bailing_pwd_change_me
+      TZ: Asia/Shanghai
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bailing -d bailing"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  web:
+    build: .
+    ports:
+      - "8010:8010"
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://bailing:bailing_pwd_change_me@db:5432/bailing
+      JWT_SECRET: please-change-me-in-production
+      CORS_ORIGINS: "*"
+      RATE_LIMIT_PER_MIN: "300"
+      LOG_LEVEL: INFO
+    volumes:
+      - ./uploads:/app/uploads
+      - ./logs:/app/logs
+
+volumes:
+  pgdata:
