@@ -1,17 +1,42 @@
-name: Deploy bailing_doctor
+name: CI/CD Deploy bailing_doctor
 
-# 课程五补充·第七章 CI/CD 主线：push 到 main → 自托管 runner 自动拉取并部署
+# 专高六·第三阶段 Linux 本地化部署 —— 课程五补充第七章 CI/CD 主线
+# push 到 main → 自托管 runner（centos7-local）→ 拉取代码 → 同步依赖 → 重启 systemd → 健康检查
 on:
   push:
     branches: [main]
   workflow_dispatch:
 
+concurrency:
+  group: deploy-bailing-doctor
+  cancel-in-progress: false
+
 jobs:
   deploy:
-    # 与 centos7 虚拟机上的 runner 标签一致（见 /root/actions-runner-bailing/.runner）
+    name: 部署到 CentOS7 虚拟机
     runs-on: [self-hosted, centos7-local]
     steps:
-      - name: 1. 拉取最新代码
+      - name: 0. 触发信息
+        run: |
+          echo "仓库: ${{ github.repository }}"
+          echo "提交: ${{ github.sha }}"
+          echo "触发人: ${{ github.actor }}"
+          echo "事件: ${{ github.event_name }}"
+
+      - name: 1. 部署前备份
+        run: |
+          set -e
+          mkdir -p /root/backup
+          TS=$(date +%Y%m%d_%H%M%S)
+          tar -czf /root/backup/app_deploy_$TS.tar.gz \
+            --exclude=uploads --exclude=logs --exclude='*.db' --exclude=node_modules \
+            -C /root/app . 2>/dev/null || true
+          ls -lh /root/backup/app_deploy_$TS.tar.gz
+          # 仅保留最近 5 份，避免磁盘占满
+          ls -1t /root/backup/app_deploy_*.tar.gz 2>/dev/null | tail -n +6 | xargs -r rm -f
+          echo "备份完成"
+
+      - name: 2. 拉取最新代码（SSH deploy key）
         run: |
           set -e
           cd /root/app
@@ -19,14 +44,14 @@ jobs:
           git reset --hard origin/main
           echo "当前提交: $(git log -1 --pretty='%h %s')"
 
-      - name: 2. 安装/更新 Python 依赖
+      - name: 3. 同步 Python 依赖
         run: |
           set -e
           cd /root/app
           /opt/miniconda3/envs/bailing/bin/pip install -q -r requirements.txt
           echo "依赖已同步"
 
-      - name: 3. 重启 systemd 服务
+      - name: 4. 重启 systemd 服务
         run: |
           set -e
           systemctl restart bailing
@@ -34,16 +59,20 @@ jobs:
           systemctl is-active bailing
           echo "服务已重启"
 
-      - name: 4. 健康检查
+      - name: 5. 健康检查
         run: |
           set -e
-          root_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 http://127.0.0.1:8010/)
-          api_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 http://127.0.0.1:8010/api/health)
-          echo "首页 HTTP $root_code"
-          echo "接口 HTTP $api_code"
-          if [ "$root_code" != "200" ] || [ "$api_code" != "200" ]; then
-            echo "健康检查失败，最近日志："
-            tail -50 /root/app/logs/*.log 2>/dev/null || journalctl -u bailing -n 50 --no-pager
+          ok=0
+          for i in 1 2 3; do
+            root_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 http://127.0.0.1:8010/ || echo 000)
+            api_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 http://127.0.0.1:8010/api/health || echo 000)
+            echo "第 $i 次探测：首页 HTTP $root_code / 接口 HTTP $api_code"
+            if [ "$root_code" = "200" ] && [ "$api_code" = "200" ]; then ok=1; break; fi
+            sleep 3
+          done
+          if [ "$ok" != "1" ]; then
+            echo "::error::健康检查失败"
+            journalctl -u bailing -n 50 --no-pager
             exit 1
           fi
-          echo "健康检查通过"
+          echo "健康检查通过，部署成功"
