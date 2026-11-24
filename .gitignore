@@ -10,3 +10,6 @@ __pycache__/
 *.pyc
 .idea/
 node_modules/
+
+# Windows 保留设备名残留文件
+NUL
