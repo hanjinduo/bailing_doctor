@@ -42,7 +42,10 @@ jobs:
           cd /root/app
           git fetch --all --prune
           git reset --hard origin/main
+          # 清理未被 git 跟踪的前端旧产物：历史 tar 部署遗留的旧 hash chunk 不会被 reset 删除
+          git clean -fdq static/ || true
           echo "当前提交: $(git log -1 --pretty='%h %s')"
+          echo "static 文件数: $(find static/ -type f | wc -l)（跟踪 $(git ls-files static/ | wc -l)）"
 
       - name: 3. 同步 Python 依赖
         run: |
