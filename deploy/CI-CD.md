@@ -1,3 +1,14 @@
+---
+AIGC:
+    Label: "1"
+    ContentProducer: 001191440300708461136T1XGW3
+    ProduceID: 9e0d676646cf2ab4665bcf1595228cef_73490659e79f11f18e5a525400de85a5
+    ReservedCode1: t3zwAOLKTlfUkEFP7tbdW6lOL2L8ZPRGrrnWk+iO6YyunMaROVrj3ondgNVLxOpZycA8o+E4aK1TX8v8h+Xy5tg6LCXNEdS/v2t9qbbsvQ+tArRTD50zZ1cHxSJt5we990PBInCBPiN7ENv7nR5dSKvRCxsWCvye5e3fRzZdAMhKiUQN90fT4Gvh4aQ=
+    ContentPropagator: 001191440300708461136T1XGW3
+    PropagateID: 9e0d676646cf2ab4665bcf1595228cef_73490659e79f11f18e5a525400de85a5
+    ReservedCode2: t3zwAOLKTlfUkEFP7tbdW6lOL2L8ZPRGrrnWk+iO6YyunMaROVrj3ondgNVLxOpZycA8o+E4aK1TX8v8h+Xy5tg6LCXNEdS/v2t9qbbsvQ+tArRTD50zZ1cHxSJt5we990PBInCBPiN7ENv7nR5dSKvRCxsWCvye5e3fRzZdAMhKiUQN90fT4Gvh4aQ=
+---
+
 # 百灵医生 · GitHub Actions CI/CD 自动化部署说明
 
 > 归属：专高六 · 第三阶段 Linux 本地化部署 —— 课程五补充 第七章「GitHub Actions CI/CD」
@@ -139,3 +150,4 @@ cd /root && tar -xzf /root/backup/app_deploy_<时间戳>.tar.gz -C /root/app && 
 | #1 | 38d6225 | push（首次，runner 尚未接管） | failure（预期，用于验证链路拦截） |
 | #2 | 6dc6320 | workflow 更新提交 | success（6 步全绿） |
 | #3 | 121d272 | 健康接口加 `ci` 字段 | success，线上 `/api/health` 返回 `"ci":"github-actions"`，证明端到端自动部署生效 |
+*（内容由AI生成，仅供参考）*
