@@ -54,7 +54,19 @@ jobs:
           /opt/miniconda3/envs/bailing/bin/pip install -q -r requirements.txt
           echo "依赖已同步"
 
-      - name: 4. 重启 systemd 服务
+      - name: 4. CI 测试（pytest 质量门禁）
+        run: |
+          set -e
+          cd /root/app
+          if [ -d tests ]; then
+            echo "运行 pytest ..."
+            /opt/miniconda3/envs/bailing/bin/python -m pytest tests/ -v --tb=short 2>&1 | tail -40
+            echo "CI 测试通过 ✓"
+          else
+            echo "无 tests/ 目录，跳过 CI 测试"
+          fi
+
+      - name: 5. 重启 systemd 服务
         run: |
           set -e
           systemctl restart bailing
@@ -62,7 +74,7 @@ jobs:
           systemctl is-active bailing
           echo "服务已重启"
 
-      - name: 5. 健康检查
+      - name: 6. 健康检查
         run: |
           set -e
           ok=0

@@ -31,7 +31,7 @@ const submit = async () => {
   <div>
     <div style="padding: 56px 24px 0; text-align: center">
       <div style="font-size: 52px">🩺</div>
-      <div style="font-size: 22px; font-weight: 700; margin: 10px 0 2px">百灵医生111</div>
+      <div style="font-size: 22px; font-weight: 700; margin: 10px 0 2px">🩺 百灵医生 · DevOps 自动部署演示成功 ✓</div>
       <div class="muted" style="margin-bottom: 26px">三甲名医在线 · 图文语音视频问诊</div>
     </div>
     <div style="padding: 0 24px">

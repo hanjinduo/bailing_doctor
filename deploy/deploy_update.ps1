@@ -105,12 +105,22 @@ if ($NoRestart) {
     Say "`n[6/6] 跳过重启（-NoRestart）。改动需执行 systemctl restart bailing 后生效"
 } else {
     Say "`n[6/6] 重启服务并做健康检查 ..."
-    $null = RunSSH "systemctl restart bailing && sleep 3 && systemctl is-active bailing"
-    Start-Sleep -Seconds 2
-    $code = RunSSH "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1/ ; echo"
-    $api  = RunSSH "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1/api/doctors ; echo"
-    Say "  首页 HTTP $($code -join '')  |  接口 HTTP $($api -join '')"
-    if ("$code" -notmatch "200") { throw "首页健康检查未返回 200，请查看 journalctl -u bailing -n 50" }
+    $null = RunSSH "systemctl restart bailing"
+    $ok = $false
+    for ($i = 1; $i -le 3; $i++) {
+        Start-Sleep -Seconds 3
+        $code = RunSSH "curl -s -o /dev/null -w '%{http_code}' --max-time 10 http://127.0.0.1:8010/ ; echo"
+        $api  = RunSSH "curl -s -o /dev/null -w '%{http_code}' --max-time 10 http://127.0.0.1:8010/api/health ; echo"
+        $codeStr = $code -join ''
+        $apiStr  = $api  -join ''
+        Say "  第 $i 次探测：首页 HTTP $codeStr  |  接口 HTTP $apiStr"
+        if ($codeStr -match "200" -and $apiStr -match "200") { $ok = $true; break }
+    }
+    if (-not $ok) {
+        RunSSH "journalctl -u bailing -n 30 --no-pager" | ForEach-Object { Say "    $_" }
+        throw "健康检查失败，请查看上方日志"
+    }
+    Say "  健康检查通过 ✓"
 }
 
 Say "`n==== 部署完成 $(Get-Date -Format 'HH:mm:ss') ===="
