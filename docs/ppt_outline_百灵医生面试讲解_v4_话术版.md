@@ -165,15 +165,15 @@ AIGC:
 - ⑦ 对了，再补充一点：补充一点：这些测试不是摆样子，限流把测试拦成 429、安全头没挂上，都是它抓出来的。
 - ⑧ 最终结果 · 量化指标：6 套测试、零第三方依赖、全绿；8 份报告对应 8 轮改造；一条命令可现场复跑。
 
-### 19 话术 9｜交付与运维：真的上线过，还更新过
-- ① 简单介绍项目 · 我的职责：这个项目不是本地跑完就交，真上过 CentOS7，还更新过两次。 / 部署脚本、systemd、Nginx 都是我自己配的。
-- ② 应用场景 · 为什么非做不可：第一次上线是手工敲命令；第二次要保证几秒内恢复、失败能回退。 / 如果没有脚本化，每次上线都是一次冒险。
-- ③ 技术选型 · 对比 3 种方案：① 手工 scp 覆盖：最快，但没有备份，出错回不去。 / ② CI/CD 平台：规范，但个人项目再加一台构建机成本过高。 / ③ 本地脚本串起来：打包、传、备份、解压、装依赖、重启、健康校验。
-- ④ 最终选择 · 为什么是它：选③。够用、可控，每一步都有输出，失败立刻能退。 / 这也是我理解的上线和跑过 demo 的区别。
-- ⑤ 实现步骤 1 / 2 / 3：一、容器化：Dockerfile 加 compose 加 .dockerignore，一条命令起服务。 / 二、生产用 conda 环境加 systemd 托管 uvicorn，Nginx 反代，Cloudflare 隧道做公网演示。 / 三、启动时 init_schema 建表，MIGRATE_COLS 自动补缺列，全程零手工 SQL。
-- ⑥ 问题场景 → 解决方案：场景一：PowerShell 调 ssh 首次连接，警告写进 stderr 被当成错误，脚本直接中断。 / 解决方案：accept-new 加 Continue 加 2>&1 过滤，把警告和真错误分开。 / 场景二：更新后新加的列不存在，接口 500。 / 解决方案：MIGRATE_COLS 启动时补列，改表不用手工执行 SQL。
-- ⑦ 对了，再补充一点：补充一点：重复部署中断时间约 3 秒，客户端几乎无感。这 3 秒是我盯着 curl 健康检查数出来的。
-- ⑧ 最终结果 · 量化指标：2 次生产部署；更新中断约 3 秒；零手工 SQL 建表与补列；systemctl 与 docs/ 可查。
+### 19 话术 9｜DevOps：标准 GitHub Actions CI/CD 自动化部署
+- ① 简单介绍项目 · 我的职责：这个项目从"本地 PowerShell 脚本手动部署"一路升级到了标准的 GitHub Actions + 自托管 Runner CI/CD 流水线，整个部署体系的设计、落地和三次真实部署都是我一个人做的。
+- ② 应用场景 · 为什么非做不可：早期手动部署一次两分钟、SSH scp 容易出错、虚拟机是 VMware NAT 内网（192.168.232.128）没公网 IP，GitHub 官方 Runner 连不上，等于没有远程自动部署能力，而且手动部署没法追溯"这次上线对应哪个 commit"。
+- ③ 技术选型 · 对比 3 种方案：① 继续用 PowerShell 脚本手动触发：已经能跑，但每次上线还是手动敲；② GitHub 官方 Runner：push 即部署，但官方 Runner 在外网，我那台 NAT 内网虚拟机连不到，job 永远 queued；③ GitHub Actions CI + 自托管 Runner（反向连接）：push 自动触发、pytest 质量门禁、自动备份回滚、健康检查，唯一代价是要配 Runner systemd + SSH Deploy Key + 解决 NAT 穿透。
+- ④ 最终选择 · 为什么是它：选③。真正的 CI/CD 不是"有个脚本能跑"，是 push 即部署、自动测试把关、自动回滚兜底、每一步可追溯。自托管 Runner 的关键是它反向连 GitHub——内网机器主动 poll 有没有任务，这样 NAT 内网也能跑 CI/CD，不用公网 IP。
+- ⑤ 实现步骤 1 / 2 / 3 / 4 / 5 / 6：deploy.yml 一共 6 步：一、触发信息；二、自动备份旧版本到 /root/backup/，只留最近 5 份；三、git fetch + reset --hard 拉最新代码 + git clean -fdq static/ 清前端旧 hash chunk；四、pytest tests/ 质量门禁，5 个测试文件全绿才继续；五、systemctl restart bailing + is-active；六、循环 3 次健康检查，首页 + /api/health 双 200 才算成功，失败自动 journalctl 拉日志。
+- ⑥ 问题场景 → 解决方案：场景一：虚拟机访问 github.com:443 TLS 超时，HTTPS 走不通 → 改成 SSH 协议 + /root/.ssh/config 强制 ssh.github.com:443 端口 + Deploy Key 只读权限。场景二：健康检查只 sleep 5 秒就 curl，服务启动慢误报 502 → 改成循环 3 次每次间隔 3 秒，双接口都要 200。场景三：前端改了页面上线后没变 → 虚拟机没 Node.js，改前端先本地 npm run build 再 push，后端直接 push 就行。
+- ⑦ 对了，我再补充一点：为什么不用 Docker？Dockerfile 和 compose 我都留着作为上云方案，但当前目标机 CentOS7 + NAT 内网 + 无公网，docker pull 也慢，systemd 更轻量。另外有了 CI/CD 之后原来的 deploy_update.ps1 就变成应急兜底了。
+- ⑧ 最终结果 · 量化指标：git push main → 自动部署，端到端 30-60 秒；每次自动备份；pytest 质量门禁；健康检查 3 次循环探测；GitHub Actions 日志每次绑定 commit hash。已完成 3 次真实 CI/CD 闭环部署。
 
 ### 20 对比说服：与典型课程项目差在哪
 - 鉴权｜调库签发即止｜可撤销 + 弱密钥拒绝启动 + 密码惰性升级

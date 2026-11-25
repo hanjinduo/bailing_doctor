@@ -145,9 +145,11 @@ cd /root && tar -xzf /root/backup/app_deploy_<时间戳>.tar.gz -C /root/app && 
 
 ## 九、验证记录
 
-| 序号 | 提交 | 触发方式 | 结果 |
-| --- | --- | --- | --- |
-| #1 | 38d6225 | push（首次，runner 尚未接管） | failure（预期，用于验证链路拦截） |
-| #2 | 6dc6320 | workflow 更新提交 | success（6 步全绿） |
-| #3 | 121d272 | 健康接口加 `ci` 字段 | success，线上 `/api/health` 返回 `"ci":"github-actions"`，证明端到端自动部署生效 |
+| 序号 | 提交 | 触发方式 | 结果 | 备注 |
+| --- | --- | --- | --- | --- |
+| #1 | 38d6225 | push（首次，runner 尚未接管） | failure（预期） | 用于验证链路拦截 |
+| #2 | 6dc6320 | workflow 更新提交 | success（6 步全绿） | 首次自托管 Runner 执行 |
+| #3 | 121d272 | 健康接口加 `ci` 字段 | success | 线上 `/api/health` 返回 `"ci":"github-actions"` |
+| #4 | 1427020 | push（CI/CD 流水线补全 pytest + 健康检查循环重试） | success | pytest 首次进入 CI 环节；健康检查改为 3 次循环；deploy.yml 6 步定型 |
+| #5 | 9824705 | push（登录页标题更新） | success | 端到端自动部署验证；虚拟机 `/root/app` git log = `9824705`；备份 `app_deploy_*.tar.gz` 自动生成于 15:29 |
 *（内容由AI生成，仅供参考）*
