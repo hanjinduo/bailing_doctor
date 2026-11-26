@@ -215,7 +215,7 @@ onMounted(() => preview(false))
       <template v-else>
         <div v-for="r in pv.rxs" :key="r.id" class="opt" :class="{ on: rxSel && rxSel.id === r.id }" @click="chooseRx(r)">
           <div class="b">{{ r.diag }}</div>
-          <div class="muted">{{ r.no }} · 可使用</div>
+          <div class="muted">{{ r.no }} · {{ r.dept }} · {{ r.source || '线上问诊' }} · {{ r.created }}</div>
         </div>
         <div v-if="!(pv.rxs || []).length" class="empty">
           没有「可使用」状态的处方<br /><br />

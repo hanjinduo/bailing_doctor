@@ -126,7 +126,7 @@ def llm_stream(messages, timeout=60):
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT, phone TEXT UNIQUE,
   pwd TEXT, name TEXT, sex TEXT DEFAULT '男', age INT DEFAULT 30, avatar TEXT DEFAULT '👤',
-  vip_until TEXT, created TEXT);
+  vip_until TEXT, created TEXT, role TEXT DEFAULT 'patient', allergy TEXT);
 CREATE TABLE IF NOT EXISTS depts(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, icon TEXT, intro TEXT);
 CREATE TABLE IF NOT EXISTS doctors(id INTEGER PRIMARY KEY AUTOINCREMENT, dept_id INT, name TEXT,
   title TEXT, hospital TEXT, good TEXT, intro TEXT, years INT, fee REAL, icon TEXT);
@@ -143,12 +143,14 @@ CREATE TABLE IF NOT EXISTS records(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id
   path TEXT, note TEXT, created TEXT);
 CREATE TABLE IF NOT EXISTS rxs(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INT, chat_id INT,
   doctor_id INT, dept TEXT, diag TEXT, advice TEXT, status TEXT DEFAULT '审核中',
-  expire TEXT, created TEXT);
+  expire TEXT, created TEXT, rx_no TEXT, patient TEXT, doc_sign TEXT, audit_by TEXT,
+  audit_at TEXT, reject_reason TEXT, used_at TEXT, order_id INT, source TEXT DEFAULT '线上问诊',
+  img TEXT, conflict TEXT);
 CREATE TABLE IF NOT EXISTS rx_items(id INTEGER PRIMARY KEY AUTOINCREMENT, rx_id INT, name TEXT,
-  spec TEXT, usage TEXT, days INT, qty INT);
+  spec TEXT, usage TEXT, days INT, qty INT, med_id INT DEFAULT 0, remark TEXT);
 CREATE TABLE IF NOT EXISTS meds(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, cat TEXT,
   spec TEXT, price REAL, intro TEXT, icon TEXT, rx INT DEFAULT 0, sales INT DEFAULT 0,
-  stock INT DEFAULT NULL);
+  stock INT DEFAULT NULL, control INT DEFAULT 0);
 CREATE TABLE IF NOT EXISTS cart(user_id INT, med_id INT, qty INT, PRIMARY KEY(user_id, med_id));
 CREATE TABLE IF NOT EXISTS orders(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INT, items TEXT,
   amount REAL, pay TEXT, status TEXT, rx_id INT, addr_id INT, coupon_id INT, discount REAL DEFAULT 0,
@@ -172,16 +174,28 @@ CREATE TABLE IF NOT EXISTS reviews(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id
 
 # 旧库平滑升级：缺列自动补
 MIGRATE_COLS = {
-    "users": [("avatar", "TEXT DEFAULT '👤'"), ("token_ver", "INT DEFAULT 0")],
+    # role: patient（患者）/ pharmacist（药师）/ admin（管理员）。审方等动作按角色鉴权。
+    # allergy: 患者过敏史，开方与购药时用于拦截禁忌药品。
+    "users": [("avatar", "TEXT DEFAULT '👤'"), ("token_ver", "INT DEFAULT 0"),
+              ("role", "TEXT DEFAULT 'patient'"), ("allergy", "TEXT")],
     "chats": [("fee", "REAL DEFAULT 0"), ("pay", "TEXT"), ("pay_time", "TEXT"),
               ("deleted", "INT DEFAULT 0")],
-    "rxs": [("status", "TEXT DEFAULT '审核中'"), ("expire", "TEXT")],
+    # 处方要素补全：编号 / 患者姓名 / 医师签名 / 药师审核留痕 / 使用留痕 /
+    # 关联订单 / 来源（线上问诊 or 线下上传）/ 线下处方影像 / 配伍禁忌结论
+    "rxs": [("status", "TEXT DEFAULT '审核中'"), ("expire", "TEXT"),
+            ("rx_no", "TEXT"), ("patient", "TEXT"), ("doc_sign", "TEXT"),
+            ("audit_by", "TEXT"), ("audit_at", "TEXT"), ("reject_reason", "TEXT"),
+            ("used_at", "TEXT"), ("order_id", "INT"), ("source", "TEXT DEFAULT '线上问诊'"),
+            ("img", "TEXT"), ("conflict", "TEXT")],
+    # 处方明细与药品目录建立真实绑定：med_id=0 表示该药名未匹配到在售商品
+    "rx_items": [("med_id", "INT DEFAULT 0"), ("remark", "TEXT")],
     "orders": [("addr_id", "INT"), ("coupon_id", "INT"), ("discount", "REAL DEFAULT 0"),
                ("ship_fee", "REAL DEFAULT 0"), ("kind", "TEXT DEFAULT '商品'"),
                ("chat_id", "INT"), ("pay_time", "TEXT"), ("note", "TEXT"),
                ("ship_time", "TEXT"), ("finish_time", "TEXT"), ("express_no", "TEXT"),
                ("deleted", "INT DEFAULT 0")],
-    "meds": [("sales", "INT DEFAULT 0"), ("stock", "INT DEFAULT NULL")],
+    # control：特殊管理药品标记，1=麻醉/精神类等特管药品，线上禁售须线下凭处方
+    "meds": [("sales", "INT DEFAULT 0"), ("stock", "INT DEFAULT NULL"), ("control", "INT DEFAULT 0")],
 }
 
 # 高频过滤列建索引。
@@ -246,6 +260,24 @@ def migrate():
     db.run("UPDATE rxs SET status='可使用' WHERE status IS NULL OR status=''")
     db.run("UPDATE chats SET status='问诊中' WHERE status='进行中'")
     db.run("UPDATE orders SET status='待发货' WHERE status='已支付'")
+
+    # ---- 处方域升级：老数据补齐新要素（全部幂等，重跑不覆盖人工调整） ----
+    # 老处方没有编号/患者/签名/来源，按 id 与既有字段补齐，避免详情页出现空值
+    for r in q("SELECT id, created, user_id, doctor_id FROM rxs WHERE rx_no IS NULL OR rx_no=''"):
+        urow = db.one("SELECT name FROM users WHERE id=?", (r["user_id"],)) or {}
+        drow = db.one("SELECT name, title FROM doctors WHERE id=?", (r["doctor_id"],)) or {}
+        db.run("UPDATE rxs SET rx_no=?, patient=?, doc_sign=?, source='线上问诊' WHERE id=?",
+               (rx_no_of(r["id"], r["created"]), urow.get("name") or "本人",
+                doc_sign_of(drow.get("name"), drow.get("title"), r["created"]), r["id"]))
+    db.run("UPDATE rxs SET source='线上问诊' WHERE source IS NULL OR source=''")
+    # 老处方明细没有 med_id：按药名精确匹配在售商品，建立处方与药品的真实绑定
+    for it in q("SELECT id, name FROM rx_items WHERE med_id IS NULL OR med_id=0"):
+        mm = db.one("SELECT id FROM meds WHERE name=?", (it["name"],))
+        if mm:
+            db.run("UPDATE rx_items SET med_id=? WHERE id=?", (mm["id"], it["id"]))
+    # 特殊管理药品标记：地西泮片（第二类精神药品）、复方甘草片（含阿片粉的麻醉药品复方制剂）
+    db.run("UPDATE meds SET control=1 WHERE name IN ('地西泮片', '复方甘草片')")
+    db.run("UPDATE meds SET control=0 WHERE control IS NULL")
 
 
 def q(sql, args=(), one=False):
@@ -317,7 +349,7 @@ DOCTORS = [
     ("皮肤科", "邓佳", "主治医师", "痤疮、脱发、过敏性皮炎", 8, 20)]
 
 # 商城金刚区分类（顺序即前端展示顺序）
-MED_CATS = ["感冒发热", "儿科用药", "耳鼻喉", "皮肤用药", "肠胃用药", "营养保健", "慢病用药", "抗感染", "中成药"]
+MED_CATS = ["感冒发热", "儿科用药", "耳鼻喉", "皮肤用药", "肠胃用药", "营养保健", "慢病用药", "抗感染", "中成药", "精神药品"]
 
 # (药名, 分类, 规格, 价格, 简介, 图标, 是否处方药)
 MEDS = [
@@ -344,7 +376,9 @@ MEDS = [
     ("复合维生素B片", "营养保健", "100片", 13.5, "补充B族维生素，用于口角炎、疲劳乏力", "🟡", 0),
     ("氨溴索口服溶液", "感冒发热", "100ml", 29.8, "祛痰药，用于痰液黏稠不易咳出", "🧪", 0),
     ("维生素D滴剂", "营养保健", "400IU*30粒", 26.0, "促进钙吸收，用于儿童与成人维生素D缺乏", "☀️", 0),
-    ("复方甘草片", "感冒发热", "100片", 9.9, "镇咳祛痰，用于上呼吸道感染引起的咳嗽", "🍂", 0)]
+    ("复方甘草片", "感冒发热", "100片", 9.9, "镇咳祛痰，用于上呼吸道感染引起的咳嗽", "🍂", 0),
+    # 特殊管理药品：第二类精神药品，线上禁售（加购/下单直接拦截，需线下凭专用处方购买）
+    ("地西泮片", "精神药品", "2.5mg*20片", 18.0, "用于焦虑、失眠，属第二类精神药品，须线下凭专用处方购买", "🌙", 1)]
 
 COUPON_TPLS = [("满9减5", 5, 9, "全场", 7, "🎫"),
                ("满29减10", 10, 29, "全场", 15, "🎁"),
@@ -437,6 +471,7 @@ def seed():
         if not q("SELECT id FROM pkgs WHERE name=?", (p[0],), one=True):
             x("INSERT INTO pkgs(name,sub,price,icon,intro,days) VALUES(?,?,?,?,?,?)", p)
     uid = ensure_demo_user()
+    ensure_demo_pharmacist()
     if not q("SELECT id FROM addresses WHERE user_id=?", (uid,), one=True):
         x("INSERT INTO addresses(user_id,name,phone,region,detail,is_default,created) VALUES(?,?,?,?,?,?,?)",
           (uid, "张三", "18812345678", "浙江省杭州市余杭区", "仓前街道 111 号 3 幢 502 室", 1, now()))
@@ -473,6 +508,17 @@ def ensure_demo_user():
         return u["id"]
     return x("INSERT INTO users(phone,pwd,name,sex,age,created) VALUES(?,?,?,?,?,?)",
              ("13800000000", hash_password("123456"), "李小百", "男", 28, now()))
+
+
+def ensure_demo_pharmacist():
+    """药师演示账号：审方权限与患者账号物理分离，患者无法自审处方"""
+    ph = q("SELECT id FROM users WHERE phone='13900000000'", one=True)
+    if ph:
+        if (q("SELECT role FROM users WHERE id=?", (ph["id"],), one=True) or {}).get("role") != "pharmacist":
+            x("UPDATE users SET role='pharmacist' WHERE id=?", (ph["id"],))
+        return ph["id"]
+    return x("INSERT INTO users(phone,pwd,name,sex,age,created,role) VALUES(?,?,?,?,?,?,?)",
+             ("13900000000", hash_password("123456"), "陈药师", "女", 36, now(), "pharmacist"))
 
 
 # ==================== 密码哈希：pbkdf2_sha256 + 随机盐 ====================
@@ -865,9 +911,12 @@ def depts():
 def me(u: int = Depends(uid)):
     close_timeout()
     rx_auto_expire()
-    usr = q("SELECT id,phone,name,sex,age,avatar,vip_until,created FROM users WHERE id=?", (u,), one=True)
+    usr = q("SELECT id,phone,name,sex,age,avatar,vip_until,created,role,allergy FROM users WHERE id=?", (u,), one=True)
     if not usr:
         return {"ok": False, "msg": "用户不存在"}
+    usr["role"] = usr.get("role") or "patient"
+    usr["is_pharmacist"] = usr["role"] in ("pharmacist", "admin")
+    usr["is_doctor"] = usr["role"] == "doctor"
     cnt = lambda sql, a=(): (q(sql, a, one=True) or {"n": 0})["n"]
     # 所有订单 / 会话统计统一排除软删除（deleted=1），与列表接口口径一致
     ORD_LIVE = " AND COALESCE(deleted,0)=0"
@@ -900,6 +949,21 @@ def me_update(body: ProfileIn, u: int = Depends(uid)):
     if body.avatar:
         x("UPDATE users SET avatar=? WHERE id=?", (body.avatar, u))
     return {"ok": True, "msg": "资料已更新"}
+
+
+@app.get("/api/allergy")
+def allergy_get(u: int = Depends(uid)):
+    """过敏史：开方前必须被参考，否则处方可能开出致敏药"""
+    row = q("SELECT allergy FROM users WHERE id=?", (u,), one=True) or {}
+    txt = row.get("allergy") or ""
+    return {"ok": True, "allergy": txt, "list": [a for a in re.split(r"[,，、;；\s]+", txt) if a]}
+
+
+@app.put("/api/allergy")
+def allergy_set(body: schemas.AllergyIn, u: int = Depends(uid)):
+    txt = (body.allergy or "").strip()
+    x("UPDATE users SET allergy=? WHERE id=?", (txt or None, u))
+    return {"ok": True, "msg": "过敏史已保存" if txt else "过敏史已清除", "allergy": txt}
 
 
 # ==================== 六、收货地址 ====================
@@ -1377,6 +1441,115 @@ def chats(limit: int = 20, offset: int = 0, u: int = Depends(uid)):
 
 
 # ==================== 十、处方（审核中 → 可使用 → 已失效） ====================
+# ==================== 处方域：角色 / 编号 / 签名 / 配伍禁忌 / 特管药品 ====================
+# 角色：patient 患者（默认）、pharmacist 药师（有权审方）、admin 管理员。
+ROLE_NAME = {"patient": "患者", "pharmacist": "药师", "admin": "管理员"}
+AUDIT_ROLES = ("pharmacist", "admin")
+
+
+def role_of(u):
+    """取用户角色，缺省按患者处理（老数据 role 为空也不会误放权）"""
+    r = q("SELECT role FROM users WHERE id=?", (u,), one=True) or {}
+    rl = (r.get("role") or "patient").strip()
+    return rl if rl in ROLE_NAME else "patient"
+
+
+def is_auditor(u):
+    return role_of(u) in AUDIT_ROLES
+
+
+def rx_no_of(rid, created=None):
+    """处方编号：BLRX + 开方日期 + 6 位流水，独立于自增 id 对外展示"""
+    d = (created or now())[:10].replace("-", "")
+    return "BLRX%s%06d" % (d or time.strftime("%Y%m%d"), int(rid))
+
+
+def doc_sign_of(name, title, created=None):
+    """医师电子签名：姓名 + 职称 + 签名时间，作为处方合法性要素之一"""
+    if not name:
+        return ""
+    return "%s（%s）签名于 %s" % (name, title or "医师", (created or now())[:16])
+
+
+# 配伍禁忌 / 重复用药规则：(药A, 药B, 风险等级, 说明)
+# high = 严重（禁止联用，购药直接拦截）；mid = 需医师确认（可下但需勾选知情）
+RX_CONFLICTS = [
+    ("藿香正气水", "头孢克肟片", "high", "藿香正气水含乙醇，与头孢类联用可致双硫仑样反应（面红、心悸、呼吸困难）"),
+    ("藿香正气水", "阿莫西林胶囊", "mid", "藿香正气水含乙醇，与抗菌药同服可能加重胃肠道反应，建议间隔 2 小时"),
+    ("复方甘草片", "氨氯地平片", "high", "甘草酸致水钠潴留，会削弱降压效果并诱发低钾血症"),
+    ("阿莫西林胶囊", "头孢克肟片", "high", "两者同属 β-内酰胺类抗菌药，同类联用不增效只增不良反应"),
+    ("布洛芬缓释胶囊", "阿托伐他汀钙片", "mid", "布洛芬与他汀联用增加肌病与肾损伤风险，需监测肌酸激酶"),
+    ("二甲双胍缓释片", "左氧氟沙星片", "mid", "氟喹诺酮类可引起血糖异常波动，与降糖药联用需加密监测血糖"),
+    ("连花清瘟胶囊", "板蓝根颗粒", "mid", "两者均为清热解毒类中成药，功效重复，联用无额外获益"),
+    ("氯雷他定片", "糠酸莫米松鼻喷雾剂", "mid", "抗组胺药与鼻用激素作用重叠，轻症择一即可，联用易致嗜睡口干"),
+]
+CONFLICT_LEVEL = {"high": "严重禁忌", "mid": "需慎用"}
+
+
+def detect_conflicts(names):
+    """检测一组药名之间的配伍禁忌，返回去重后的冲突列表（按药对无序匹配）"""
+    ns = set(n for n in names if n)
+    out, seen = [], set()
+    for a, b, lv, tip in RX_CONFLICTS:
+        if a in ns and b in ns:
+            key = tuple(sorted((a, b)))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({"a": a, "b": b, "level": lv, "level_cn": CONFLICT_LEVEL.get(lv, lv), "tip": tip})
+    out.sort(key=lambda c: 0 if c["level"] == "high" else 1)
+    return out
+
+
+def control_of(m):
+    """特殊管理药品判定：1 = 麻醉/精神类，线上禁售"""
+    try:
+        return int((m or {}).get("control") or 0) == 1
+    except Exception:
+        return False
+
+
+CONTROL_MSG = "「%s」属于特殊管理药品，按法规不得线上销售，请到线下医院凭专用处方购买"
+
+# 过敏原 → 本店在售药品的映射（过敏史常写类别而商品名是具体药，需要一层转换才能拦住）
+ALLERGY_ALIAS = {
+    "青霉素": ["阿莫西林胶囊"],
+    "头孢": ["头孢克肟片"],
+    "喹诺酮": ["左氧氟沙星片"],
+    "氟喹诺酮": ["左氧氟沙星片"],
+    "磺胺": ["复方磺胺甲噁唑片"],
+    "他汀": ["阿托伐他汀钙片"],
+    "二甲双胍": ["二甲双胍缓释片"],
+    "布洛芬": ["布洛芬缓释胶囊"],
+    "阿司匹林": ["布洛芬缓释胶囊", "对乙酰氨基酚片"],
+}
+
+
+def rx_conflicts(rx):
+    """读处方上已记录的配伍禁忌结论（写入时即算好，读取零成本）"""
+    try:
+        return json.loads((rx or {}).get("conflict") or "[]")
+    except Exception:
+        return []
+
+
+def rx_items_of(rid):
+    """处方明细（带 med_id 绑定信息与商品实时状态）"""
+    rows = q("SELECT * FROM rx_items WHERE rx_id=? ORDER BY id", (rid,))
+    out = []
+    for r in rows:
+        m = q("SELECT id, price, rx, stock, control, icon FROM meds WHERE id=?", (r["med_id"] or 0,), one=True) if r["med_id"] else None
+        out.append({"id": r["id"], "med_id": r["med_id"] or 0, "name": r["name"], "spec": r["spec"],
+                    "usage": r["usage"], "days": r["days"], "qty": r["qty"],
+                    "price": money(m["price"]) if m else 0, "icon": (m or {}).get("icon") or "💊",
+                    "rx": int((m or {}).get("rx") or 0),
+                    "control": 1 if control_of(m) else 0,
+                    "buyable": bool(m) and int((m or {}).get("rx") or 0) == 1 and not control_of(m),
+                    "stock": stock_of(m) if m else 0,
+                    "bound": bool(m)})
+    return out
+
+
 RX_FALLBACK = [
     ("连花清瘟胶囊", "口服，一次 4 粒，一日 3 次", 5, 2),
     ("维生素C片", "口服，一次 1 片，一日 3 次", 7, 1),
@@ -1396,9 +1569,17 @@ def make_rx(body: RxIn, u: int = Depends(uid)):
     d = q("SELECT * FROM doctors WHERE id=?", (c["doctor_id"],), one=True)
     conv = "\n".join("%s：%s" % ("医生" if m["role"] == "dr" else "患者", m["text"])
                      for m in q("SELECT * FROM msgs WHERE chat_id=? ORDER BY id", (c["id"],)))
+    # 药品目录：把在售药品喂给模型并回传 med_id，处方明细才能与商品库真实绑定，
+    # 这是「开方 → 药师审方 → 凭方买药」闭环的关键（原先只存药名，处方与药品零绑定）。
+    all_meds = q("SELECT id, name, cat, rx, spec, control FROM meds ORDER BY id")
+    usable = [m for m in all_meds if not control_of(m)]          # 特管药品不进线上可选目录
+    by_id = {int(m["id"]): m for m in all_meds}
+    by_name = {m["name"]: m for m in all_meds}
+    cat_txt = "；".join("%d|%s|%s|%s" % (m["id"], m["name"], "处方药" if int(m["rx"] or 0) else "OTC", m["cat"])
+                        for m in usable)
     prompt = ("请根据在线问诊对话给出处方建议，只输出 JSON，不要任何解释，格式："
-              '{"diag":"初步诊断","advice":"注意事项(2-3句)","meds":[{"name":"药名","usage":"用法用量","days":5,"qty":1}]}。'
-              "药名请从常见 OTC 药品中选择，最多 3 种。")
+              '{"diag":"初步诊断","advice":"注意事项(2-3句)","meds":[{"med_id":药品编号,"name":"药名","usage":"用法用量","days":5,"qty":1}]}。'
+              "meds 最多 3 种，药名必须从下方药品目录中原样选择并给出对应编号，不得自造药名。\n药品目录（编号|药名|类型|分类）：" + cat_txt)
     raw = llm([{"role": "system", "content": "你是%s·%s，请谨慎开具处方建议。" % (c["dept"], d["title"])},
                {"role": "user", "content": "主诉：%s\n对话：\n%s\n%s" % (c["symptom"], conv or "（无）", prompt)}])
     diag, advice, items = "", "", []
@@ -1418,18 +1599,68 @@ def make_rx(body: RxIn, u: int = Depends(uid)):
                   "请及时线下就诊。孕妇、哺乳期、肝肾功能异常者用药前请咨询医师。")
     if not items:
         items = [{"name": n, "usage": us, "days": dy, "qty": qt} for n, us, dy, qt in RX_FALLBACK]
+
+    # ---- 药名 → 商品绑定（med_id）：编号优先，其次精确药名，最后包含匹配 ----
+    patient = (q("SELECT name, allergy FROM users WHERE id=?", (u,), one=True) or {})
+    allergy_txt = (patient.get("allergy") or "").strip()
+    allergy = [w.strip() for w in re.split(r"[,，、;；/\s]+", allergy_txt) if w.strip()]
+    bound, allergy_hit, dropped = [], [], []
+    for it in items:
+        nm = (it.get("name") or "").strip()
+        mid = int(it.get("med_id") or 0)
+        m = by_id.get(mid) if mid in by_id else None
+        if not m:
+            m = by_name.get(nm)
+        if not m and nm:
+            for cand in all_meds:
+                if nm and (nm in cand["name"] or cand["name"] in nm):
+                    m = cand
+                    break
+        # 特管药品不允许出现在线上处方里：剔除并记录，提示线下就诊
+        if m and control_of(m):
+            dropped.append(m["name"])
+            continue
+        # 过敏史拦截：药名或过敏映射命中即剔除，避免开出处方即禁忌
+        hit = [a for a in allergy if (m and a in m["name"]) or nm.startswith(a) or a in nm
+               or (m and a in (m.get("cat") or ""))]
+        if m:
+            hit += [a for a in allergy if m["name"] in ALLERGY_ALIAS.get(a, [])]
+        if hit:
+            allergy_hit.append({"name": m["name"] if m else nm, "allergy": hit[0]})
+            continue
+        bound.append({"med_id": int(m["id"]) if m else 0, "name": m["name"] if m else nm,
+                      "spec": (m or {}).get("spec") or "常规规格",
+                      "usage": it.get("usage") or "按说明书服用",
+                      "days": int(it.get("days") or 5), "qty": max(1, min(9, int(it.get("qty") or 1)))})
+    if not bound:      # 全部被过敏/特管拦下时，回退到安全的基础用药，避免开空处方
+        bound = [{"med_id": int(by_name[n]["id"]) if n in by_name else 0, "name": n, "spec": "常规规格",
+                  "usage": us, "days": dy, "qty": qt} for n, us, dy, qt in RX_FALLBACK]
+    # ---- 配伍禁忌 / 重复用药检测：开方即算，结果随处方落库，审方与购药共用同一结论 ----
+    conflicts = detect_conflicts([b["name"] for b in bound])
+    if allergy_hit:
+        advice += "（已根据过敏史" + "、".join(sorted(set(a for h in allergy_hit for a in h["allergy"])))
+        advice += "自动规避" + "、".join(h["name"] for h in allergy_hit) + "）"
+    if dropped:
+        advice += "（" + "、".join(dropped) + " 属特殊管理药品，需线下凭专用处方购买）"
+
     created = now()
     expire = (date.today() + timedelta(days=3)).isoformat()
+    rx_no = ""
     rid = x("INSERT INTO rxs(user_id,chat_id,doctor_id,dept,diag,advice,status,expire,created) VALUES(?,?,?,?,?,?,?,?,?)",
             (u, c["id"], c["doctor_id"], c["dept"], diag, advice, "审核中", expire, created))
-    for i in items:
-        spec = q("SELECT spec FROM meds WHERE name=?", (i["name"],), one=True)
-        x("INSERT INTO rx_items(rx_id,name,spec,usage,days,qty) VALUES(?,?,?,?,?,?)",
-          (rid, i["name"], (spec or {}).get("spec", "常规规格"), i.get("usage", "按说明书服用"),
-           int(i.get("days") or 5), int(i.get("qty") or 1)))
-    x("INSERT INTO notices(user_id,title,body,created) VALUES(?,?,?,?)",
-      (u, "处方已开具", "处方 #%d 已提交药师审核，审核通过后可用于购买处方药。" % rid, now()))
-    return {"ok": True, "msg": "处方已开具，等待药师审核", "rx": {"id": rid, "status": "审核中"}}
+    rx_no = rx_no_of(rid, created)
+    x("UPDATE rxs SET rx_no=?, patient=?, doc_sign=?, source=?, conflict=? WHERE id=?",
+      (rx_no, patient.get("name") or "本人", doc_sign_of(d.get("name"), d.get("title"), created),
+       "线上问诊", json.dumps(conflicts, ensure_ascii=False), rid))
+    for b in bound:
+        x("INSERT INTO rx_items(rx_id,name,spec,usage,days,qty,med_id) VALUES(?,?,?,?,?,?,?)",
+          (rid, b["name"], b["spec"], b["usage"], b["days"], b["qty"], b["med_id"]))
+    body_txt = "处方 %s 已提交药师审核，审核通过后可用于购买处方药。" % rx_no
+    if conflicts:
+        body_txt += "药师提示：" + conflicts[0]["tip"]
+    x("INSERT INTO notices(user_id,title,body,created) VALUES(?,?,?,?)", (u, "处方已开具", body_txt, now()))
+    return {"ok": True, "msg": "处方已开具，等待药师审核", "rx": {"id": rid, "no": rx_no, "status": "审核中"},
+            "conflicts": conflicts, "allergy_hit": allergy_hit}
 
 
 @app.get("/api/rxs")
@@ -1445,7 +1676,7 @@ def rxs(status: str = "", limit: int = 20, offset: int = 0, u: int = Depends(uid
     rows = q("SELECT r.*, d.name doc, d.title " + sql + " ORDER BY r.id DESC LIMIT ? OFFSET ?",
              args + [limit, offset])
     for r in rows:
-        r["no"] = "BL-RX-%06d" % r["id"]
+        r["no"] = r["rx_no"] or rx_no_of(r["id"], r["created"])
         r["count"] = len(q("SELECT id FROM rx_items WHERE rx_id=?", (r["id"],)))
     # tabs 是全部状态的分组计数，必须用全量统计，不能受分页影响
     allrows = q("SELECT status, COUNT(*) n FROM rxs WHERE user_id=? GROUP BY status", (u,))
@@ -1455,27 +1686,165 @@ def rxs(status: str = "", limit: int = 20, offset: int = 0, u: int = Depends(uid
     return {"ok": True, "rxs": rows, "tabs": tabs, **page_meta(total, limit, offset, len(rows))}
 
 
+@app.get("/api/rx/pending")
+def rx_pending(limit: int = 20, offset: int = 0, u: int = Depends(uid)):
+    """药师审方台：列出全平台待审处方（仅药师/管理员可见）"""
+    if not is_auditor(u):
+        return {"ok": False, "msg": "仅药师可查看待审处方", "rx": [], "total": 0}
+    limit, offset = paging(limit, offset)
+    total = (q("SELECT COUNT(*) n FROM rxs WHERE status='审核中'", one=True) or {}).get("n") or 0
+    rows = q("SELECT r.*, d.name doc, d.title, us.name patient_name, us.phone FROM rxs r "
+             "LEFT JOIN doctors d ON d.id=r.doctor_id LEFT JOIN users us ON us.id=r.user_id "
+             "WHERE r.status='审核中' ORDER BY r.id LIMIT ? OFFSET ?", (limit, offset))
+    for r in rows:
+        r["no"] = r["rx_no"] or rx_no_of(r["id"], r["created"])
+        r["items"] = rx_items_of(r["id"])
+        r["conflicts"] = rx_conflicts(r)
+    return {"ok": True, "rx": rows, "is_auditor": True, **page_meta(total, limit, offset, len(rows))}
+
+
 @app.get("/api/rx/{rid}")
 def rx_get(rid: int, u: int = Depends(uid)):
+    """处方详情：本人可看；药师/管理员也可看（审方需要）"""
     r = rx_row(rid)
-    if not r or r["user_id"] != u:
+    auditor = is_auditor(u)
+    if not r or (r["user_id"] != u and not auditor):
         return {"ok": False, "msg": "处方不存在"}
-    d = q("SELECT * FROM doctors WHERE id=?", (r["doctor_id"],), one=True)
-    r.update({"doc": d["name"], "title": d["title"], "no": "BL-RX-%06d" % r["id"]})
-    return {"ok": True, "rx": r, "items": q("SELECT * FROM rx_items WHERE rx_id=?", (rid,))}
+    d = q("SELECT * FROM doctors WHERE id=?", (r["doctor_id"],), one=True) or {}
+    r.update({"doc": d.get("name", ""), "title": d.get("title", ""),
+              "no": r["rx_no"] or rx_no_of(r["id"], r["created"]),
+              "sign": r["doc_sign"] or doc_sign_of(d.get("name"), d.get("title"), r["created"]),
+              "mine": r["user_id"] == u, "can_audit": auditor and r["status"] == "审核中"})
+    return {"ok": True, "rx": r, "items": rx_items_of(rid),
+            "conflicts": rx_conflicts(r), "auditor": auditor}
 
 
 @app.post("/api/rx/{rid}/audit")
 def rx_audit(rid: int, u: int = Depends(uid)):
+    """药师审方通过：必须有药师/管理员角色，患者本人不得自审（原实现允许患者自审，属 P0 缺陷）"""
+    if not is_auditor(u):
+        return {"ok": False, "msg": "仅药师有权审核处方，患者本人不能自审"}
     r = rx_row(rid)
-    if not r or r["user_id"] != u:
+    if not r:
         return {"ok": False, "msg": "处方不存在"}
     if r["status"] != "审核中":
         return {"ok": False, "msg": "当前状态为「%s」，无需审核" % r["status"]}
-    x("UPDATE rxs SET status='可使用' WHERE id=?", (rid,))
+    who = (q("SELECT name FROM users WHERE id=?", (u,), one=True) or {}).get("name") or "药师"
+    # 严重配伍禁忌的处方不允许直接放行，须医师改方后重开
+    high = [c for c in rx_conflicts(r) if c["level"] == "high"]
+    if high:
+        return {"ok": False, "msg": "存在严重配伍禁忌（%s），不能通过审核，请医师调整处方后重开"
+                                    % "；".join("%s+%s" % (c["a"], c["b"]) for c in high)}
+    no = r["rx_no"] or rx_no_of(r["id"], r["created"])
+    x("UPDATE rxs SET status='可使用', audit_by=?, audit_at=? WHERE id=?", (who, now(), rid))
     x("INSERT INTO notices(user_id,title,body,created) VALUES(?,?,?,?)",
-      (u, "处方审核通过", "处方 #%d 已通过药师审核，有效期至 %s，可凭方购买处方药。" % (rid, r["expire"]), now()))
-    return {"ok": True, "msg": "药师审核通过，处方已可使用"}
+      (r["user_id"], "处方审核通过",
+       "处方 %s 已由药师%s审核通过，有效期至 %s，可凭方购买处方药。" % (no, who, r["expire"]), now()))
+    return {"ok": True, "msg": "审方通过，处方已可使用", "audit_by": who}
+
+
+@app.post("/api/rx/{rid}/reject")
+def rx_reject(rid: int, body: schemas.RxRejectIn, u: int = Depends(uid)):
+    """药师驳回处方：必须写明理由，患者侧可见并据此重新问诊"""
+    if not is_auditor(u):
+        return {"ok": False, "msg": "仅药师有权驳回处方"}
+    r = rx_row(rid)
+    if not r:
+        return {"ok": False, "msg": "处方不存在"}
+    if r["status"] != "审核中":
+        return {"ok": False, "msg": "当前状态为「%s」，不能驳回" % r["status"]}
+    reason = (body.reason or "").strip() or "用药指征不明确，建议线下复诊"
+    who = (q("SELECT name FROM users WHERE id=?", (u,), one=True) or {}).get("name") or "药师"
+    no = r["rx_no"] or rx_no_of(r["id"], r["created"])
+    x("UPDATE rxs SET status='已失效', audit_by=?, audit_at=?, reject_reason=? WHERE id=?",
+      (who, now(), reason, rid))
+    x("INSERT INTO notices(user_id,title,body,created) VALUES(?,?,?,?)",
+      (r["user_id"], "处方未通过审核", "处方 %s 被药师%s驳回：%s。请重新问诊或线下就诊。" % (no, who, reason), now()))
+    return {"ok": True, "msg": "已驳回，并通知患者", "reason": reason}
+
+
+@app.post("/api/rx/{rid}/buy")
+def rx_buy(rid: int, u: int = Depends(uid)):
+    """按方加购：把处方内可售处方药按处方剂量一次性加入购物车，避免逐个人工找药"""
+    r = rx_row(rid)
+    if not r or r["user_id"] != u:
+        return {"ok": False, "msg": "处方不存在"}
+    if r["status"] != "可使用":
+        return {"ok": False, "msg": "处方状态为「%s」，不可购药" % r["status"]}
+    items = rx_items_of(rid)
+    if not items:
+        return {"ok": False, "msg": "处方内无药品明细"}
+    added, skipped = 0, []
+    with db.tx() as tx:
+        for it in items:
+            if not it["med_id"]:
+                skipped.append("%s（该药未在售）" % it["name"])
+                continue
+            if it["control"]:
+                skipped.append("%s（特殊管理药品不线上销售）" % it["name"])
+                continue
+            if not it["rx"]:
+                skipped.append("%s（非处方药，请直接购买）" % it["name"])
+                continue
+            m = tx.one("SELECT id, name, stock FROM meds WHERE id=?", (it["med_id"],))
+            if not m:
+                skipped.append("%s（已下架）" % it["name"])
+                continue
+            have = tx.one("SELECT qty FROM cart WHERE user_id=? AND med_id=?", (u, it["med_id"]))
+            want = (int(have["qty"]) if have else 0) + int(it["qty"])
+            if stock_of(m) and want > int(m["stock"]):
+                skipped.append("%s（库存仅 %d 件）" % (it["name"], int(m["stock"])))
+                continue
+            if have:
+                tx.run("UPDATE cart SET qty=? WHERE user_id=? AND med_id=?", (want, u, it["med_id"]))
+            else:
+                tx.run("INSERT INTO cart(user_id,med_id,qty) VALUES(?,?,?)", (u, it["med_id"], want))
+            added += 1
+    msg = "已按处方加入购物车 %d 种药品" % added
+    if skipped:
+        msg += "；未加入：" + "、".join(skipped)
+    return {"ok": added > 0, "msg": msg, "added": added, "skipped": skipped}
+
+
+@app.post("/api/rx/upload")
+async def rx_upload(file: UploadFile = File(...), dept: str = Form(""), diag: str = Form(""),
+                    note: str = Form(""), u: int = Depends(uid)):
+    """线下处方上传：患者在医院拿到的纸质/电子处方拍照上传，经药师审核后同样可用于购药。
+    走与病历上传完全一致的校验链（扩展名白名单 + content_type 一致 + magic 字节 + 5MB 上限），
+    影像由服务端改名落盘，不接受客户端文件名直接作为路径。"""
+    name = upload_safe_name(file.filename)
+    raw_ext = os.path.splitext(name)[1].lstrip(".").lower()
+    ctype = (file.content_type or "").split(";")[0].strip().lower()
+    # 与病历上传同一套三重校验：扩展名白名单 + content_type 一致 + magic 字节
+    if raw_ext not in UPLOAD_EXT_MAP or raw_ext not in UPLOAD_CTYPE_MAP.get(ctype, set()):
+        return UPLOAD_BAD_TYPE
+    head = await file.read(16)
+    if not upload_magic_ok(head, raw_ext):
+        return UPLOAD_BAD_TYPE
+    buf = bytearray(head)
+    while True:
+        chunk = await file.read(64 * 1024)
+        if not chunk:
+            break
+        buf.extend(chunk)
+        if len(buf) > UPLOAD_MAX:
+            return UPLOAD_BAD_SIZE
+    ext = UPLOAD_EXT_MAP[raw_ext]
+    fname = "rx_%d_%d_%s%s" % (u, int(time.time() * 1000), secrets.token_hex(4), ext)
+    with open(os.path.join(UPLOAD, fname), "wb") as f:
+        f.write(bytes(buf))
+    created = now()
+    expire = (date.today() + timedelta(days=3)).isoformat()
+    patient = (q("SELECT name FROM users WHERE id=?", (u,), one=True) or {}).get("name") or "本人"
+    rid = x("INSERT INTO rxs(user_id,chat_id,doctor_id,dept,diag,advice,status,expire,created,source,img,patient) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (u, 0, 0, dept or "线下医院", diag or "线下医院处方", (note or "").strip() or "凭线下处方购药，请遵医嘱使用",
+             "审核中", expire, created, "线下上传", fname, patient))
+    x("UPDATE rxs SET rx_no=?, doc_sign=? WHERE id=?",
+      (rx_no_of(rid, created), "线下医院医师签字（见影像）", rid))
+    x("INSERT INTO notices(user_id,title,body,created) VALUES(?,?,?,?)",
+      (u, "线下处方已上传", "处方 %s 已提交药师审核，通过后可直接凭方购买处方药。" % rx_no_of(rid, created), now()))
+    return {"ok": True, "msg": "线下处方已上传，等待药师审核", "rx": {"id": rid, "no": rx_no_of(rid, created)}}
 
 
 @app.post("/api/rx/{rid}/invalid")
@@ -1483,6 +1852,8 @@ def rx_invalid(rid: int, u: int = Depends(uid)):
     r = rx_row(rid)
     if not r or r["user_id"] != u:
         return {"ok": False, "msg": "处方不存在"}
+    if r["status"] == "已使用":
+        return {"ok": False, "msg": "处方已用于购药，不能作废"}
     x("UPDATE rxs SET status='已失效' WHERE id=?", (rid,))
     return {"ok": True, "msg": "处方已作废"}
 
@@ -1492,8 +1863,13 @@ def rx_del(rid: int, u: int = Depends(uid)):
     r = rx_row(rid)
     if not r or r["user_id"] != u:
         return {"ok": False, "msg": "处方不存在"}
-    if q("SELECT id FROM orders WHERE rx_id=?", (rid,), one=True):
+    if r["status"] == "已使用" or q("SELECT id FROM orders WHERE rx_id=?", (rid,), one=True):
         return {"ok": False, "msg": "该处方已用于购药订单，不能删除"}
+    if r["img"]:      # 线下处方影像属医疗资料，随处方一起清理
+        try:
+            os.remove(os.path.join(UPLOAD, r["img"]))
+        except Exception:
+            pass
     x("DELETE FROM rx_items WHERE rx_id=?", (rid,))
     x("DELETE FROM rxs WHERE id=?", (rid,))
     return {"ok": True, "msg": "处方已删除"}
@@ -1502,7 +1878,7 @@ def rx_del(rid: int, u: int = Depends(uid)):
 
 # ==================== 十一、商城：分类 / 商品 / 购物车 ====================
 CAT_ICON = {"感冒发热": "🌡️", "儿科用药": "🧸", "耳鼻喉": "👂", "皮肤用药": "🧴", "肠胃用药": "🍽️",
-            "营养保健": "🥛", "慢病用药": "🩸", "抗感染": "💉", "中成药": "🌿"}
+            "营养保健": "🥛", "慢病用药": "🩸", "抗感染": "💉", "中成药": "🌿", "精神药品": "🌙"}
 
 
 def stock_of(m):
@@ -1671,6 +2047,8 @@ def cart_add(body: CartAddIn, u: int = Depends(uid)):
     m = q("SELECT * FROM meds WHERE id=?", (body.med_id,), one=True)
     if not m:
         return {"ok": False, "msg": "商品不存在"}
+    if m.get("control"):
+        return {"ok": False, "msg": "「%s」属特殊管理药品，按国家规定不可线上销售，请到线下医院凭处方取药" % m["name"]}
     qty = body.qty
     old = q("SELECT qty FROM cart WHERE user_id=? AND med_id=?", (u, m["id"]), one=True)
     have = old["qty"] if old else 0
@@ -1756,7 +2134,10 @@ def order_preview(body: OrderPreviewIn, u: int = Depends(uid)):
     return {"ok": True, "kind": kind, "pkg": pkg, "items": items, "quote": q0, "coupons": usable,
             "coupons_disabled": others, "addresses": [addr_view(a) for a in addrs],
             "has_rx": any(i["rx"] for i in items),
-            "rxs": [{"id": r["id"], "diag": r["diag"], "no": "BL-RX-%06d" % r["id"]} for r in rx_list]}
+            "rxs": [{"id": r["id"], "diag": r["diag"], "dept": r["dept"],
+                     "no": r.get("rx_no") or rx_no_of(r["id"], r["created"]),
+                     "source": r.get("source") or "线上问诊",
+                     "created": (r.get("created") or "")[:10]} for r in rx_list]}
 
 
 @app.post("/api/order")
@@ -1771,6 +2152,12 @@ def order_create(body: OrderCreateIn, u: int = Depends(uid)):
         items = cart_items(u)
     if not items:
         return {"ok": False, "msg": "购物车为空"}
+    # 特殊管理药品（麻醉/精神类等）禁止线上销售：这是经营资质红线，必须在建单前拦截
+    for i in items:
+        if i.get("med_id"):
+            mm = q("SELECT control FROM meds WHERE id=?", (i["med_id"],), one=True) or {}
+            if mm.get("control"):
+                return {"ok": False, "msg": "「%s」属特殊管理药品，不可线上购买，请到线下医院凭处方取药" % i["name"]}
     need_rx = any(i["rx"] for i in items)
     addr = None
     if body.addr_id:
@@ -1786,8 +2173,29 @@ def order_create(body: OrderCreateIn, u: int = Depends(uid)):
         rx = rx_row(body.rx_id)
         if not rx or rx["user_id"] != u:
             return {"ok": False, "msg": "处方不存在"}
+        # 一次性使用：处方一经支付即置为已使用，杜绝无限复用
+        if rx.get("used_at") or rx["status"] == "已使用":
+            return {"ok": False, "msg": "该处方已于 %s 用于购药，不能重复使用，请重新问诊开具新处方"
+                                        % (rx.get("used_at") or "此前")}
         if rx["status"] != "可使用":
             return {"ok": False, "msg": "该处方%s，不能用于购买处方药" % rx["status"]}
+        # 处方与药品明细比对：订单里的处方药必须逐项出现在该处方内，且数量不得超过处方剂量
+        allowed = {}
+        for it in rx_items_of(rx["id"]):
+            if it.get("med_id"):
+                allowed[int(it["med_id"])] = int(it["qty"] or 0)
+        if not allowed:
+            return {"ok": False, "msg": "该处方无可用药品明细，请重新问诊开具"}
+        for i in items:
+            if not i.get("rx"):
+                continue
+            mid = int(i.get("med_id") or 0)
+            if mid not in allowed:
+                return {"ok": False, "msg": "「%s」不在处方 %s 的药品目录内，处方药不能跨方购买"
+                                            % (i["name"], rx.get("rx_no") or "#%d" % rx["id"])}
+            if int(i["qty"]) > allowed[mid]:
+                return {"ok": False, "msg": "「%s」购买 %d 件，超过处方开具数量 %d 件（处方总量不可超量购买）"
+                                            % (i["name"], int(i["qty"]), allowed[mid])}
     # 库存预检：下单前先挡一次，避免用户走到支付页才被拒。
     # 真正的强一致在 order_pay 的事务内用条件 UPDATE 扣减兜住（并发下不会超卖）。
     for i in items:
@@ -1971,6 +2379,14 @@ def order_pay(oid: int, body: OrderPayIn | None = None, u: int = Depends(uid)):
                   ("已完成" if svc else "待发货", pay, now(), oid))
             if t.rowcount == 0:
                 raise ValueError("订单已处理，请勿重复支付")
+            # 处方核销：同一事务内以条件更新占用处方，rowcount=0 说明该方已被其它订单占用，
+            # 整单回滚，避免「一张处方并发买两次」（原实现处方可无限复用）
+            if o["rx_id"]:
+                t.run("UPDATE rxs SET status='已使用', used_at=?, order_id=? "
+                      "WHERE id=? AND status='可使用' AND COALESCE(used_at,'')=''",
+                      (now(), oid, o["rx_id"]))
+                if t.rowcount == 0:
+                    raise ValueError("所选处方已被其它订单使用或状态已变更，本次支付已取消")
             if o["coupon_id"]:
                 t.run("UPDATE coupons SET status='已使用', used_at=? WHERE id=? AND status='已锁定'",
                       (now(), o["coupon_id"]))

@@ -3,7 +3,8 @@ import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { showConfirmDialog, showToast } from 'vant'
 import { useUserStore } from '@/stores/user'
-import { post } from '@/api'
+import { get, post, put } from '@/api'
+import Sheet from '@/components/Sheet.vue'
 
 const router = useRouter()
 const store = useUserStore()
@@ -11,6 +12,13 @@ const user = ref(null)
 const stat = ref({})
 const oc = ref({ 待支付: 0, 待发货: 0, 已发货: 0, 已完成: 0, 已退款: 0 })
 const cc = ref({ 待支付: 0, 待接诊: 0, 问诊中: 0, 已结束: 0 })
+// 用药安全与药师工作台
+const allergy = ref('')
+const allergyList = ref([])
+const showAllergy = ref(false)
+const allergyDraft = ref('')
+const pendingRx = ref(0)
+const isPh = computed(() => !!(user.value && user.value.is_pharmacist))
 
 const TEL = '400-881-8120'
 const VERSION = '1.0.0'
@@ -57,6 +65,21 @@ const go = (p, s) => {
 }
 const todo = () => showToast('功能开发中')
 
+const openAllergy = () => {
+  allergyDraft.value = allergy.value
+  showAllergy.value = true
+}
+
+const saveAllergy = async () => {
+  const j = await put('/allergy', { allergy: allergyDraft.value.trim() })
+  if (j.ok) {
+    allergy.value = j.allergy || ''
+    allergyList.value = (j.allergy || '').split(/[,，、;；\s]+/).filter((x) => x)
+    showAllergy.value = false
+    showToast(j.msg)
+  }
+}
+
 const logout = async () => {
   await showConfirmDialog({ title: '退出登录', message: '确认退出当前账号？' })
   // 先通知后端注销（token_ver+1，旧 token 立即失效）；网络异常也要清理本地状态
@@ -80,6 +103,17 @@ onMounted(async () => {
   Object.keys(oc.value).forEach((k) => { oc.value[k] = os[k] || 0 })
   const cs = stat.value.chat_status || {}
   Object.keys(cc.value).forEach((k) => { cc.value[k] = cs[k] || 0 })
+  // 过敏史：开方与购药前需参考，登录后即拉取
+  const al = await get('/allergy')
+  if (al.ok) {
+    allergy.value = al.allergy || ''
+    allergyList.value = al.list || []
+  }
+  // 药师才拉待审数量
+  if (user.value && user.value.is_pharmacist) {
+    const pd = await get('/rx/pending', { limit: 1, offset: 0 })
+    if (pd.ok) pendingRx.value = pd.total || 0
+  }
 })
 </script>
 
@@ -160,6 +194,37 @@ onMounted(async () => {
       </div>
 
       <div class="card">
+        <div class="cbar">
+          <b>用药安全</b>
+          <span v-if="isPh" class="more" @click="router.push('/rx/audit')">药师审方台 {{ pendingRx }} 张 ›</span>
+        </div>
+        <div class="tool" @click="openAllergy">
+          <div class="te">⚠️</div>
+          <div>
+            <div class="tn">过敏史</div>
+            <div class="td">{{ allergyList.length ? allergyList.join('、') : '未填写，开方前建议先完善' }}</div>
+          </div>
+          <span class="ar">›</span>
+        </div>
+        <div class="tool" @click="router.push('/rx/upload')">
+          <div class="te">📄</div>
+          <div>
+            <div class="tn">上传线下处方</div>
+            <div class="td">医院纸质处方拍照上传，药师审核后可购药</div>
+          </div>
+          <span class="ar">›</span>
+        </div>
+        <div v-if="isPh" class="tool" @click="router.push('/rx/audit')">
+          <div class="te">🩺</div>
+          <div>
+            <div class="tn">药师审方台</div>
+            <div class="td">待审 {{ pendingRx }} 张 · 含线下上传处方</div>
+          </div>
+          <span class="ar">›</span>
+        </div>
+      </div>
+
+      <div class="card">
         <div class="cbar"><b>健康工具</b><span class="more">常用</span></div>
         <div v-for="x in tools" :key="x.n" class="tool" @click="go(x.p)">
           <div class="te">{{ x.e }}</div>
@@ -170,6 +235,14 @@ onMounted(async () => {
           <span class="ar">›</span>
         </div>
       </div>
+
+      <Sheet v-model="showAllergy" title="填写过敏史">
+        <div class="muted" style="line-height: 1.8; margin-bottom: 8px">
+          多个过敏原用逗号分隔，如：青霉素，头孢。开方与购药时会自动规避致敏药品。
+        </div>
+        <textarea v-model="allergyDraft" class="ta" placeholder="如：青霉素，头孢" maxlength="120" />
+        <button class="btn" @click="saveAllergy">保存</button>
+      </Sheet>
 
       <div class="foot">
         <div class="tel" @click="todo">📞 客服电话 {{ TEL }}</div>
@@ -353,6 +426,17 @@ onMounted(async () => {
   margin-left: auto;
   color: #c3cad3;
   font-size: 16px;
+}
+.ta {
+  width: 100%;
+  height: 76px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 8px 10px;
+  font-size: 13px;
+  resize: none;
+  margin-bottom: 10px;
+  box-sizing: border-box;
 }
 .foot {
   padding: 4px 0 20px;

@@ -167,3 +167,13 @@ class ReviewIn(Base):
 
 class VipIn(Base):
     months: int = Field(default=1, ge=1, le=12)
+
+
+class RxRejectIn(Base):
+    """药师驳回处方：理由选填但落库时兜底为默认话术，患者侧可见"""
+    reason: str = Field(default="", max_length=120)
+
+
+class AllergyIn(Base):
+    """过敏史：逗号/顿号分隔的过敏原文本，空串表示清除"""
+    allergy: str = Field(default="", max_length=120)
